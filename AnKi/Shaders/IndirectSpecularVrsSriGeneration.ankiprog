@@ -1,0 +1,106 @@
+// Copyright (C) 2009-2022, Panagiotis Christopoulos Charitos and contributors.
+// All rights reserved.
+// Code licensed under the BSD License.
+// http://www.anki3d.org/LICENSE
+
+#pragma anki mutator SRI_TEXEL_DIMENSION 8 16
+#pragma anki mutator SHARED_MEMORY 0 1
+#pragma anki mutator LIMIT_RATE_TO_2X2 0 1
+
+#pragma anki start comp
+
+#include <AnKi/Shaders/Functions.glsl>
+#include <AnKi/Shaders/TonemappingFunctions.glsl>
+
+layout(set = 0, binding = 0) uniform writeonly uimage2D u_sriImg;
+layout(set = 0, binding = 1) uniform sampler u_nearestClampSampler;
+layout(set = 0, binding = 2) uniform texture2D u_directLight;
+layout(set = 0, binding = 3) uniform texture2D u_ssr;
+
+const U32 TONEMAPPING_SET = 0u;
+const U32 TONEMAPPING_BINDING = 4u;
+#include <AnKi/Shaders/TonemappingResources.glsl>
+
+const UVec2 WORKGROUP_SIZE = UVec2(SRI_TEXEL_DIMENSION);
+layout(local_size_x = WORKGROUP_SIZE.x, local_size_y = WORKGROUP_SIZE.y, local_size_z = 1) in;
+
+#if SHARED_MEMORY
+// Ideally, we'd be able to calculate the min/max/average using subgroup operations, but there's no guarantee
+// subgroupSize is large enough so we need shared memory as a fallback. We need gl_NumSubgroups entries, but it is not a
+// constant, so estimate it assuming a subgroupSize of at least 8.
+
+const U32 SHARED_MEMORY_ENTRIES = WORKGROUP_SIZE.x * WORKGROUP_SIZE.y / 8u;
+shared F32 s_contribution[SHARED_MEMORY_ENTRIES];
+#endif
+
+// Reinhard operator
+ANKI_RP Vec3 tonemapReinhard(ANKI_RP Vec3 color, ANKI_RP F32 lum, ANKI_RP F32 saturation)
+{
+	const ANKI_RP F32 toneMappedLuminance = lum / (lum + 1.0);
+	return toneMappedLuminance * pow(color / lum, Vec3(saturation));
+}
+
+Vec3 tonemapColor(Vec3 src)
+{
+	//return linearToSRgb(tonemapReinhard(src * u_exposureThreshold0, lum * u_exposureThreshold0, 1.0));
+	return linearToSRgb(tonemap(src, u_exposureThreshold0));
+}
+
+void main()
+{
+	const Vec2 uv = (Vec2(gl_GlobalInvocationID.xy) + 0.5)/Vec2(textureSize(u_ssr,0));
+	const Vec3 ssr = textureLod(sampler2D(u_ssr, u_nearestClampSampler), uv, 0.0).rgb;
+
+	const Vec3 directLight = textureLod(sampler2D(u_directLight, u_nearestClampSampler), uv, 0.0).rgb;
+	
+	const ANKI_RP Vec3 base = tonemapColor(directLight);
+	const ANKI_RP Vec3 alt  = tonemapColor(directLight-ssr);
+	const ANKI_RP Vec3 diff = abs(base-alt);
+
+	ANKI_RP F32 contribution = max(diff.r,max(diff.g,diff.b));
+	contribution = subgroupMax(contribution);
+
+#if SHARED_MEMORY
+	// Store results in shared memory.
+	ANKI_BRANCH if(subgroupElect())
+	{
+		s_contribution[gl_SubgroupID] = contribution;
+	}
+
+	memoryBarrierShared();
+	barrier();
+#endif
+
+	// Write the result
+	ANKI_BRANCH if(gl_LocalInvocationIndex == 0u)
+	{
+		// Get max across all subgroups.
+#if SHARED_MEMORY
+		contribution = s_contribution[0];
+		
+		for(U32 i = 1u; i < gl_NumSubgroups; ++i)
+		{
+			contribution = max(contribution, s_contribution[i]);
+		}
+#endif
+		
+		UVec2 rate = UVec2(1u);
+		if(contribution<=0.001)
+		{
+			rate = UVec2(4u);
+		}
+		else if(contribution<0.004)
+		{
+			rate = UVec2(2u);
+		}
+
+#if LIMIT_RATE_TO_2X2
+		rate = min(rate, UVec2(2u));
+#endif
+
+		const UVec2 outTexelCoord = gl_WorkGroupID.xy;
+		imageStore(u_sriImg, IVec2(outTexelCoord), UVec4(encodeVrsRate(rate)));
+	}
+}
+
+#pragma anki end

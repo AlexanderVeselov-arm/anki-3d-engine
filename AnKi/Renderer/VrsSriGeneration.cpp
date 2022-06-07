@@ -6,6 +6,9 @@
 #include <AnKi/Renderer/VrsSriGeneration.h>
 #include <AnKi/Renderer/Renderer.h>
 #include <AnKi/Renderer/TemporalAA.h>
+#include <AnKi/Renderer/LightShading.h>
+#include <AnKi/Renderer/IndirectSpecular.h>
+#include <AnKi/Renderer/Tonemapping.h>
 #include <AnKi/Core/ConfigSet.h>
 
 namespace anki {
@@ -56,42 +59,47 @@ Error VrsSriGeneration::initInternal()
 													"VrsSriDownscaled");
 	m_downscaledSriTex = m_r->createAndClearRenderTarget(sriInitInfo, TextureUsageBit::FRAMEBUFFER_SHADING_RATE);
 
+	m_ssrSriTex = m_r->createAndClearRenderTarget(sriInitInfo, TextureUsageBit::FRAMEBUFFER_SHADING_RATE);
+
+	const bool useSharedMemory =
+		(getGrManager().getDeviceCapabilities().m_minSubgroupSize < m_sriTexelDimension*2);
+
 	// Load programs
-	ANKI_CHECK(getResourceManager().loadResource("ShaderBinaries/VrsSriGenerationCompute.ankiprogbin", m_prog));
-	ShaderProgramResourceVariantInitInfo variantInit(m_prog);
-	variantInit.addMutation("SRI_TEXEL_DIMENSION", m_sriTexelDimension);
-
-	if(m_sriTexelDimension == 16 && getGrManager().getDeviceCapabilities().m_minSubgroupSize >= 32)
 	{
-		// Algorithm's workgroup size is 32, GPU's subgroup size is min 32 -> each workgroup has 1 subgroup -> No need
-		// for shared mem
-		variantInit.addMutation("SHARED_MEMORY", 0);
+		ANKI_CHECK(getResourceManager().loadResource("ShaderBinaries/VrsSriGenerationCompute.ankiprogbin", m_prog));
+		ShaderProgramResourceVariantInitInfo variantInit(m_prog);
+		variantInit.addMutation("SRI_TEXEL_DIMENSION", m_sriTexelDimension);
+		variantInit.addMutation("SHARED_MEMORY", useSharedMemory);
+		variantInit.addMutation("LIMIT_RATE_TO_2X2", getConfig().getRVrsLimitTo2x2());
+
+		const ShaderProgramResourceVariant* variant;
+		m_prog->getOrCreateVariant(variantInit, variant);
+		m_grProg = variant->getProgram();
 	}
-	else if(m_sriTexelDimension == 8 && getGrManager().getDeviceCapabilities().m_minSubgroupSize >= 16)
 	{
-		// Algorithm's workgroup size is 16, GPU's subgroup size is min 16 -> each workgroup has 1 subgroup -> No need
-		// for shared mem
-		variantInit.addMutation("SHARED_MEMORY", 0);
+		ANKI_CHECK(getResourceManager().loadResource("ShaderBinaries/IndirectSpecularVrsSriGeneration.ankiprogbin",
+													 m_progSSR));
+		ShaderProgramResourceVariantInitInfo variantInit(m_progSSR);
+		variantInit.addMutation("SRI_TEXEL_DIMENSION", m_sriTexelDimension);
+		variantInit.addMutation("SHARED_MEMORY", useSharedMemory);
+		variantInit.addMutation("LIMIT_RATE_TO_2X2", getConfig().getRVrsLimitTo2x2());
+
+		const ShaderProgramResourceVariant* variant;
+		m_progSSR->getOrCreateVariant(variantInit, variant);
+		m_grProgSSR = variant->getProgram();
 	}
-	else
+
 	{
-		variantInit.addMutation("SHARED_MEMORY", 1);
+		const ShaderProgramResourceVariant* variant;
+		ANKI_CHECK(getResourceManager().loadResource("ShaderBinaries/VrsSriVisualizeRenderTarget.ankiprogbin",
+													 m_visualizeProg));
+		m_visualizeProg->getOrCreateVariant(variant);
+		m_visualizeGrProg = variant->getProgram();
+
+		ANKI_CHECK(getResourceManager().loadResource("ShaderBinaries/VrsSriDownscale.ankiprogbin", m_downscaleProg));
+		m_downscaleProg->getOrCreateVariant(variant);
+		m_downscaleGrProg = variant->getProgram();
 	}
-
-	variantInit.addMutation("LIMIT_RATE_TO_2X2", getConfig().getRVrsLimitTo2x2());
-
-	const ShaderProgramResourceVariant* variant;
-	m_prog->getOrCreateVariant(variantInit, variant);
-	m_grProg = variant->getProgram();
-
-	ANKI_CHECK(
-		getResourceManager().loadResource("ShaderBinaries/VrsSriVisualizeRenderTarget.ankiprogbin", m_visualizeProg));
-	m_visualizeProg->getOrCreateVariant(variant);
-	m_visualizeGrProg = variant->getProgram();
-
-	ANKI_CHECK(getResourceManager().loadResource("ShaderBinaries/VrsSriDownscale.ankiprogbin", m_downscaleProg));
-	m_downscaleProg->getOrCreateVariant(variant);
-	m_downscaleGrProg = variant->getProgram();
 
 	return Error::NONE;
 }
@@ -106,7 +114,8 @@ void VrsSriGeneration::getDebugRenderTarget(CString rtName, RenderTargetHandle& 
 	else
 	{
 		ANKI_ASSERT(rtName == "VrsSriDownscaled");
-		handle = m_runCtx.m_downscaledRt;
+		//handle = m_runCtx.m_downscaledRt;
+		handle = m_runCtx.m_ssrRt;
 	}
 
 	optionalShaderProgram = m_visualizeGrProg;
@@ -124,12 +133,15 @@ void VrsSriGeneration::importRenderTargets(RenderingContext& ctx)
 	{
 		m_runCtx.m_rt = ctx.m_renderGraphDescr.importRenderTarget(m_sriTex);
 		m_runCtx.m_downscaledRt = ctx.m_renderGraphDescr.importRenderTarget(m_downscaledSriTex);
+		m_runCtx.m_ssrRt = ctx.m_renderGraphDescr.importRenderTarget(m_ssrSriTex);
 	}
 	else
 	{
 		m_runCtx.m_rt = ctx.m_renderGraphDescr.importRenderTarget(m_sriTex, TextureUsageBit::FRAMEBUFFER_SHADING_RATE);
 		m_runCtx.m_downscaledRt =
 			ctx.m_renderGraphDescr.importRenderTarget(m_downscaledSriTex, TextureUsageBit::FRAMEBUFFER_SHADING_RATE);
+		m_runCtx.m_ssrRt =
+			ctx.m_renderGraphDescr.importRenderTarget(m_ssrSriTex, TextureUsageBit::FRAMEBUFFER_SHADING_RATE);
 		m_sriTexImportedOnce = true;
 	}
 }
@@ -166,6 +178,29 @@ void VrsSriGeneration::populateRenderGraph(RenderingContext& ctx)
 			const U32 fakeWorkgroupSizeXorY = m_sriTexelDimension;
 			dispatchPPCompute(cmdb, fakeWorkgroupSizeXorY, fakeWorkgroupSizeXorY, m_r->getInternalResolution().x(),
 							  m_r->getInternalResolution().y());
+		});
+	}
+
+	// SRI-SSR generation
+	{
+		ComputeRenderPassDescription& pass = rgraph.newComputeRenderPass("VRS SRI for reflections");
+
+		pass.newDependency(RenderPassDependency(m_runCtx.m_ssrRt, TextureUsageBit::IMAGE_COMPUTE_WRITE));
+		pass.newDependency(RenderPassDependency(m_r->getLightShading().getRt(), TextureUsageBit::SAMPLED_COMPUTE));
+
+		pass.setWork([this](RenderPassWorkContext& rgraphCtx) {
+			const UVec2 resolution = m_r->getInternalResolution() / 2;
+			CommandBufferPtr& cmdb = rgraphCtx.m_commandBuffer;
+
+			cmdb->bindShaderProgram(m_grProgSSR);
+
+			rgraphCtx.bindImage(0, 0, m_runCtx.m_ssrRt);
+			cmdb->bindSampler(0, 1, m_r->getSamplers().m_nearestNearestClamp);
+			rgraphCtx.bindColorTexture(0, 2, m_r->getLightShading().getRt());
+			rgraphCtx.bindColorTexture(0, 3, m_r->getIndirectSpecular().getRt());
+			rgraphCtx.bindUniformBuffer(0, 4, m_r->getTonemapping().getAverageLuminanceBuffer());
+
+			dispatchPPCompute(cmdb, m_sriTexelDimension, m_sriTexelDimension, resolution.x(), resolution.y());
 		});
 	}
 

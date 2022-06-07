@@ -127,7 +127,7 @@ void IndirectSpecular::populateRenderGraph(RenderingContext& ctx)
 		{
 			GraphicsRenderPassDescription& pass = rgraph.newGraphicsRenderPass("SSR");
 			pass.setFramebufferInfo(m_fbDescr, {m_runCtx.m_rts[WRITE]}, {},
-									(enableVrs) ? m_r->getVrsSriGeneration().getDownscaledSriRt()
+									(enableVrs) ? m_r->getVrsSriGeneration().getSsrRt()
 												: RenderTargetHandle());
 
 			ppass = &pass;
@@ -136,13 +136,14 @@ void IndirectSpecular::populateRenderGraph(RenderingContext& ctx)
 
 			if(enableVrs)
 			{
-				ppass->newDependency(RenderPassDependency(m_r->getVrsSriGeneration().getDownscaledSriRt(),
+				ppass->newDependency(RenderPassDependency(m_r->getVrsSriGeneration().getSsrRt(),
 														  TextureUsageBit::FRAMEBUFFER_SHADING_RATE));
 			}
 		}
 
 		ppass->newDependency(RenderPassDependency(m_runCtx.m_rts[WRITE], writeUsage));
 		ppass->newDependency(RenderPassDependency(m_runCtx.m_rts[READ], readUsage));
+		ppass->newDependency(RenderPassDependency(m_r->getGBuffer().getColorRt(0), readUsage));
 		ppass->newDependency(RenderPassDependency(m_r->getGBuffer().getColorRt(1), readUsage));
 		ppass->newDependency(RenderPassDependency(m_r->getGBuffer().getColorRt(2), readUsage));
 
@@ -188,31 +189,33 @@ void IndirectSpecular::run(const RenderingContext& ctx, RenderPassWorkContext& r
 	// Bind all
 	cmdb->bindSampler(0, 1, m_r->getSamplers().m_trilinearClamp);
 
-	rgraphCtx.bindColorTexture(0, 2, m_r->getGBuffer().getColorRt(1));
-	rgraphCtx.bindColorTexture(0, 3, m_r->getGBuffer().getColorRt(2));
+	rgraphCtx.bindColorTexture(0, 2, m_r->getGBuffer().getColorRt(0));
+	rgraphCtx.bindColorTexture(0, 3, m_r->getGBuffer().getColorRt(1));
+	rgraphCtx.bindColorTexture(0, 4, m_r->getGBuffer().getColorRt(2));
 
 	TextureSubresourceInfo hizSubresource;
 	hizSubresource.m_mipmapCount = depthLod + 1;
-	rgraphCtx.bindTexture(0, 4, m_r->getDepthDownscale().getHiZRt(), hizSubresource);
+	rgraphCtx.bindTexture(0, 5, m_r->getDepthDownscale().getHiZRt(), hizSubresource);
 
-	rgraphCtx.bindColorTexture(0, 5, m_r->getDownscaleBlur().getRt());
+	rgraphCtx.bindColorTexture(0, 6, m_r->getDownscaleBlur().getRt());
+	cmdb->bindTexture(0, 7, m_r->getProbeReflections().getIntegrationLut());
 
-	rgraphCtx.bindColorTexture(0, 6, m_runCtx.m_rts[READ]);
-	rgraphCtx.bindColorTexture(0, 7, m_r->getMotionVectors().getMotionVectorsRt());
-	rgraphCtx.bindColorTexture(0, 8, m_r->getMotionVectors().getHistoryLengthRt());
+	rgraphCtx.bindColorTexture(0, 8, m_runCtx.m_rts[READ]);
+	rgraphCtx.bindColorTexture(0, 9, m_r->getMotionVectors().getMotionVectorsRt());
+	rgraphCtx.bindColorTexture(0, 10, m_r->getMotionVectors().getHistoryLengthRt());
 
-	cmdb->bindSampler(0, 9, m_r->getSamplers().m_trilinearRepeat);
-	cmdb->bindTexture(0, 10, m_noiseImage->getTextureView());
+	cmdb->bindSampler(0, 11, m_r->getSamplers().m_trilinearRepeat);
+	cmdb->bindTexture(0, 12, m_noiseImage->getTextureView());
 
 	const ClusteredShadingContext& binning = ctx.m_clusteredShading;
-	bindUniforms(cmdb, 0, 11, binning.m_clusteredShadingUniformsToken);
-	bindUniforms(cmdb, 0, 12, binning.m_reflectionProbesToken);
-	rgraphCtx.bindColorTexture(0, 13, m_r->getProbeReflections().getReflectionRt());
-	bindStorage(cmdb, 0, 14, binning.m_clustersToken);
+	bindUniforms(cmdb, 0, 13, binning.m_clusteredShadingUniformsToken);
+	bindUniforms(cmdb, 0, 14, binning.m_reflectionProbesToken);
+	rgraphCtx.bindColorTexture(0, 15, m_r->getProbeReflections().getReflectionRt());
+	bindStorage(cmdb, 0, 16, binning.m_clustersToken);
 
 	if(getConfig().getRPreferCompute())
 	{
-		rgraphCtx.bindImage(0, 15, m_runCtx.m_rts[WRITE], TextureSubresourceInfo());
+		rgraphCtx.bindImage(0, 17, m_runCtx.m_rts[WRITE], TextureSubresourceInfo());
 
 		dispatchPPCompute(cmdb, 8, 8, m_r->getInternalResolution().x() / 2, m_r->getInternalResolution().y() / 2);
 	}

@@ -18,30 +18,32 @@ layout(set = 0, binding = 0, row_major) uniform b_unis
 };
 
 layout(set = 0, binding = 1) uniform sampler u_trilinearClampSampler;
-layout(set = 0, binding = 2) uniform ANKI_RP texture2D u_gbufferRt1;
-layout(set = 0, binding = 3) uniform ANKI_RP texture2D u_gbufferRt2;
-layout(set = 0, binding = 4) uniform texture2D u_depthRt;
-layout(set = 0, binding = 5) uniform ANKI_RP texture2D u_lightBufferRt;
+layout(set = 0, binding = 2) uniform ANKI_RP texture2D u_gbufferRt0;
+layout(set = 0, binding = 3) uniform ANKI_RP texture2D u_gbufferRt1;
+layout(set = 0, binding = 4) uniform ANKI_RP texture2D u_gbufferRt2;
+layout(set = 0, binding = 5) uniform texture2D u_depthRt;
+layout(set = 0, binding = 6) uniform ANKI_RP texture2D u_lightBufferRt;
+layout(set = 0, binding = 7) uniform ANKI_RP texture2D u_integrationLut;
 
-layout(set = 0, binding = 6) uniform ANKI_RP texture2D u_historyTex;
-layout(set = 0, binding = 7) uniform texture2D u_motionVectorsTex;
-layout(set = 0, binding = 8) uniform ANKI_RP texture2D u_historyLengthTex;
+layout(set = 0, binding = 8) uniform ANKI_RP texture2D u_historyTex;
+layout(set = 0, binding = 9) uniform texture2D u_motionVectorsTex;
+layout(set = 0, binding = 10) uniform ANKI_RP texture2D u_historyLengthTex;
 
-layout(set = 0, binding = 9) uniform sampler u_trilinearRepeatSampler;
-layout(set = 0, binding = 10) uniform ANKI_RP texture2D u_noiseTex;
+layout(set = 0, binding = 11) uniform sampler u_trilinearRepeatSampler;
+layout(set = 0, binding = 12) uniform ANKI_RP texture2D u_noiseTex;
 const Vec2 NOISE_TEX_SIZE = Vec2(64.0);
 
 #define CLUSTERED_SHADING_SET 0u
-#define CLUSTERED_SHADING_UNIFORMS_BINDING 11u
-#define CLUSTERED_SHADING_REFLECTIONS_BINDING 12u
-#define CLUSTERED_SHADING_CLUSTERS_BINDING 14u
+#define CLUSTERED_SHADING_UNIFORMS_BINDING 13u
+#define CLUSTERED_SHADING_REFLECTIONS_BINDING 14u
+#define CLUSTERED_SHADING_CLUSTERS_BINDING 16u
 #include <AnKi/Shaders/ClusteredShadingCommon.glsl>
 
 #if defined(ANKI_COMPUTE_SHADER)
 const UVec2 WORKGROUP_SIZE = UVec2(8, 8);
 layout(local_size_x = WORKGROUP_SIZE.x, local_size_y = WORKGROUP_SIZE.y, local_size_z = 1) in;
 
-layout(set = 0, binding = 15) uniform writeonly image2D u_outImg;
+layout(set = 0, binding = 17) uniform writeonly image2D u_outImg;
 #else
 layout(location = 0) in Vec2 in_uv;
 layout(location = 0) out Vec3 out_color;
@@ -59,9 +61,15 @@ void main()
 	const Vec2 uv = in_uv;
 #endif
 
+	// GBuffer
+	GbufferInfo gbuffer;
+	unpackGBufferNoVelocity(textureLod(u_gbufferRt0, u_trilinearClampSampler, uv, 0.0),
+							textureLod(u_gbufferRt1, u_trilinearClampSampler, uv, 0.0),
+							textureLod(u_gbufferRt2, u_trilinearClampSampler, uv, 0.0), gbuffer);
+
 	// Read part of the G-buffer
-	const F32 roughness = unpackRoughnessFromGBuffer(textureLod(u_gbufferRt1, u_trilinearClampSampler, uv, 0.0));
-	const Vec3 worldNormal = unpackNormalFromGBuffer(textureLod(u_gbufferRt2, u_trilinearClampSampler, uv, 0.0));
+	const F32 roughness = gbuffer.m_roughness; //unpackRoughnessFromGBuffer(textureLod(u_gbufferRt1, u_trilinearClampSampler, uv, 0.0));
+	const Vec3 worldNormal = gbuffer.m_normal; //unpackNormalFromGBuffer(textureLod(u_gbufferRt2, u_trilinearClampSampler, uv, 0.0));
 
 	// Get depth
 	const F32 depth = textureLod(u_depthRt, u_trilinearClampSampler, uv, 0.0).r;
@@ -251,6 +259,18 @@ void main()
 		}
 
 		outColor = mix(probeColor, outColor, ssrAttenuation);
+	}
+
+	// BRDF
+	{
+	// const Vec3 env = specularDFG(gbuffer.m_f0, gbuffer.m_roughness, u_integrationLut, u_linearAnyClampSampler, NoV);
+	const Vec2 ndc = UV_TO_NDC(uv);
+	const Vec4 worldPos4 = u_clusteredShading.m_matrices.m_invertedViewProjectionJitter * Vec4(ndc, depth, 1.0);
+	const Vec3 worldPos = worldPos4.xyz / worldPos4.w;
+	const ANKI_RP Vec3 viewDir = normalize(u_clusteredShading.m_cameraPosition - worldPos);
+	const F32 NoV = max(0.0, dot(gbuffer.m_normal, viewDir));
+	const Vec3 env = specularDFG(gbuffer.m_f0, gbuffer.m_roughness, u_integrationLut, u_trilinearClampSampler, NoV);
+	outColor *= env;
 	}
 
 	// Store
